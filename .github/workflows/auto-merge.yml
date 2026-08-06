@@ -1,0 +1,123 @@
+name: Auto Merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-merge:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+      # No checkout on purpose.
+      # pull_request_target runs with a write token; checking out the fork's
+      # code here would let a contributor execute arbitrary commands with it.
+      # The file list comes from the API instead, so nothing untrusted runs.
+      - name: Validate PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # One "<status><TAB><path>" line per changed file.
+          CHANGES=$(gh api --paginate \
+            "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[] | [.status, .filename] | @tsv')
+
+          if [ -z "$CHANGES" ]; then
+            echo "❌ This PR changes no files."
+            exit 1
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGES"
+          echo
+
+          # Tab-delimited cut, so paths containing spaces survive intact.
+          PATHS=$(cut -f2 <<< "$CHANGES")
+
+          ###########################################
+          # Rule 1: No deletes
+          ###########################################
+          DELETED=$(awk -F'\t' '$1 == "removed" { print $2 }' <<< "$CHANGES")
+          if [ -n "$DELETED" ]; then
+            echo "❌ File deletion is not allowed:"
+            echo "$DELETED"
+            exit 1
+          fi
+
+          ###########################################
+          # Rule 2: No renames or copies
+          ###########################################
+          RENAMED=$(awk -F'\t' '$1 == "renamed" || $1 == "copied" { print $2 }' <<< "$CHANGES")
+          if [ -n "$RENAMED" ]; then
+            echo "❌ File renaming is not allowed:"
+            echo "$RENAMED"
+            exit 1
+          fi
+
+          # Catch-all for anything that is not a plain add or edit.
+          OTHER=$(awk -F'\t' '$1 != "added" && $1 != "modified" { print $1 ": " $2 }' <<< "$CHANGES")
+          if [ -n "$OTHER" ]; then
+            echo "❌ Only added or modified files are allowed. Found:"
+            echo "$OTHER"
+            exit 1
+          fi
+
+          ###########################################
+          # Rule 3: Maximum 2 changed files
+          ###########################################
+          FILE_COUNT=$(wc -l <<< "$PATHS")
+          if [ "$FILE_COUNT" -gt 2 ]; then
+            echo "❌ Too many files changed."
+            echo "Changed files: $FILE_COUNT"
+            echo "Maximum allowed: 2"
+            exit 1
+          fi
+
+          ###########################################
+          # Rule 4: Everything must be under students/<name>/
+          # The pattern also rejects loose files sitting directly
+          # in students/, which would otherwise look like a folder.
+          ###########################################
+          INVALID=$(grep -Ev '^students/[^/]+/.+' <<< "$PATHS" || true)
+          if [ -n "$INVALID" ]; then
+            echo "❌ Files outside students/<name>/ were modified:"
+            echo "$INVALID"
+            exit 1
+          fi
+
+          ###########################################
+          # Rule 5: Only one student's directory
+          ###########################################
+          STUDENT_DIRS=$(cut -d/ -f1-2 <<< "$PATHS" | sort -u)
+          DIR_COUNT=$(wc -l <<< "$STUDENT_DIRS")
+          if [ "$DIR_COUNT" -ne 1 ]; then
+            echo "❌ Changes span multiple student folders:"
+            echo "$STUDENT_DIRS"
+            exit 1
+          fi
+
+          echo "✅ Student folder: $STUDENT_DIRS"
+          echo "✅ Validation successful."
+
+      - name: Auto merge PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --merge
